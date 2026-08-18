@@ -1,5 +1,5 @@
 """
-RFQ智能报价助手 - Web应用
+RFQ智能报价助手 - Web应用（简化版，兼容Vercel）
 """
 
 import os
@@ -7,49 +7,58 @@ import json
 import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template, send_from_directory
-from flask_sqlalchemy import SQLAlchemy
 from PIL import Image
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'rfq-analyzer-secret-key-2026')
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///rfq_analyzer.db'
-app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-db = SQLAlchemy(app)
+# 确保目录存在
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs('outputs', exist_ok=True)
+os.makedirs('/tmp/outputs', exist_ok=True)
 
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    ip_address = db.Column(db.String(50), unique=True, nullable=False)
-    free_count = db.Column(db.Integer, default=3)
-    total_used = db.Column(db.Integer, default=0)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_used_at = db.Column(db.DateTime, default=datetime.utcnow)
+# 使用JSON文件代替数据库
+DATA_FILE = '/tmp/users.json'
+RECORDS_FILE = '/tmp/records.json'
 
-class AnalysisRecord(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    image_path = db.Column(db.String(255), nullable=False)
-    product_info = db.Column(db.Text)
-    report_path = db.Column(db.String(255))
-    status = db.Column(db.String(20), default='pending')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+def load_data(filepath):
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_data(filepath, data):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
 
 def get_or_create_user(ip_address):
-    user = User.query.filter_by(ip_address=ip_address).first()
-    if not user:
-        user = User(ip_address=ip_address, free_count=3)
-        db.session.add(user)
-        db.session.commit()
-    return user
+    users = load_data(DATA_FILE)
+    if ip_address not in users:
+        users[ip_address] = {'free_count': 3, 'total_used': 0, 'created_at': datetime.now().isoformat()}
+        save_data(DATA_FILE, users)
+    return users[ip_address]
+
+def save_record(record_id, record_data):
+    records = load_data(RECORDS_FILE)
+    records[str(record_id)] = record_data
+    save_data(RECORDS_FILE, records)
+
+def get_record(record_id):
+    records = load_data(RECORDS_FILE)
+    return records.get(str(record_id))
+
+def update_record(record_id, updates):
+    records = load_data(RECORDS_FILE)
+    if str(record_id) in records:
+        records[str(record_id)].update(updates)
+        save_data(RECORDS_FILE, records)
 
 def check_usage_limit(user):
-    if user.free_count > 0:
-        return True, f"免费次数剩余：{user.free_count}次"
+    if user['free_count'] > 0:
+        return True, f"免费次数剩余：{user['free_count']}次"
     return False, "免费次数已用完，请付费继续使用（0.5元/次）"
 
 @app.route('/')
@@ -65,26 +74,51 @@ def upload():
         return jsonify({'error': '文件名为空'}), 400
     if not file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
         return jsonify({'error': '只支持JPG、PNG、WEBP格式'}), 400
+
     filename = f"{uuid.uuid4().hex}{os.path.splitext(file.filename)[1]}"
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
+
     ip = request.remote_addr
     user = get_or_create_user(ip)
     can_use, message = check_usage_limit(user)
     if not can_use:
         return jsonify({'error': message, 'need_payment': True}), 402
-    record = AnalysisRecord(user_id=user.id, image_path=filepath, status='processing')
-    db.session.add(record)
-    db.session.commit()
-    return jsonify({'success': True, 'record_id': record.id, 'message': message, 'free_count': user.free_count})
 
-@app.route('/api/analyze/<int:record_id>', methods=['POST'])
+    record_id = uuid.uuid4().hex
+    record_data = {
+        'record_id': record_id,
+        'user_ip': ip,
+        'image_path': filepath,
+        'status': 'processing',
+        'product_info': None,
+        'report_path': None,
+        'created_at': datetime.now().isoformat()
+    }
+    save_record(record_id, record_data)
+
+    return jsonify({
+        'success': True,
+        'record_id': record_id,
+        'message': message,
+        'free_count': user['free_count']
+    })
+
+@app.route('/api/analyze/<record_id>', methods=['POST'])
 def analyze(record_id):
-    record = AnalysisRecord.query.get_or_404(record_id)
-    user = User.query.get(record.user_id)
+    record = get_record(record_id)
+    if not record:
+        return jsonify({'error': '记录不存在'}), 404
+
+    users = load_data(DATA_FILE)
+    user = users.get(record['user_ip'])
+    if not user:
+        return jsonify({'error': '用户不存在'}), 404
+
     can_use, message = check_usage_limit(user)
     if not can_use:
         return jsonify({'error': message, 'need_payment': True}), 402
+
     try:
         product_info = {
             'product_name': '识别到的产品名称',
@@ -92,25 +126,25 @@ def analyze(record_id):
             'buyer_country': '买家国家',
             'specifications': '规格参数'
         }
-        record.product_info = json.dumps(product_info, ensure_ascii=False)
-        record.status = 'completed'
-        user.free_count -= 1
-        user.total_used += 1
-        user.last_used_at = datetime.utcnow()
-        db.session.commit()
-        return jsonify({'success': True, 'product_info': product_info, 'free_count': user.free_count})
+        update_record(record_id, {'product_info': product_info, 'status': 'completed'})
+        user['free_count'] -= 1
+        user['total_used'] += 1
+        users[record['user_ip']] = user
+        save_data(DATA_FILE, users)
+
+        return jsonify({'success': True, 'product_info': product_info, 'free_count': user['free_count']})
     except Exception as e:
-        record.status = 'failed'
-        db.session.commit()
+        update_record(record_id, {'status': 'failed'})
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/report/<int:record_id>', methods=['POST'])
+@app.route('/api/report/<record_id>', methods=['POST'])
 def generate_report(record_id):
-    record = AnalysisRecord.query.get_or_404(record_id)
-    if record.status != 'completed':
+    record = get_record(record_id)
+    if not record or record['status'] != 'completed':
         return jsonify({'error': '分析未完成'}), 400
+
     try:
-        product_info = json.loads(record.product_info) if record.product_info else {}
+        product_info = record.get('product_info', {})
         doc = Document()
         title = doc.add_heading('RFQ报价分析报告', 0)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -120,25 +154,23 @@ def generate_report(record_id):
         doc.add_paragraph(f"产品名称：{product_info.get('product_name', '未知')}")
         doc.add_paragraph(f"数量：{product_info.get('quantity', '未知')}")
         doc.add_paragraph(f"规格：{product_info.get('specifications', '未知')}")
-        report_filename = f"RFQ_Report_{record.id}.docx"
-        report_path = os.path.join('outputs', report_filename)
+
+        report_filename = f"RFQ_Report_{record_id}.docx"
+        report_path = os.path.join('/tmp/outputs', report_filename)
         doc.save(report_path)
-        record.report_path = report_path
-        db.session.commit()
+        update_record(record_id, {'report_path': report_path})
+
         return jsonify({'success': True, 'report_path': report_path})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/download/<int:record_id>')
+@app.route('/api/download/<record_id>')
 def download_report(record_id):
-    record = AnalysisRecord.query.get_or_404(record_id)
-    if not record.report_path:
+    record = get_record(record_id)
+    if not record or not record.get('report_path'):
         return jsonify({'error': '报告未生成'}), 404
-    return send_from_directory('outputs', os.path.basename(record.report_path), as_attachment=True)
+    return send_from_directory('/tmp/outputs', os.path.basename(record['report_path']), as_attachment=True)
 
-with app.app_context():
-    db.create_all()
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+# Vercel 部署入口
+def handler(request, response):
+    return app(request, response)
